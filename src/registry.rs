@@ -65,16 +65,8 @@ pub fn newer_releases(
         }
 
         let (namespace, provider_type) = public_registry_address(&provider.source)?;
-        let baseline = provider
-            .versions
-            .keys()
-            .map(|version| Version::parse(version).context("parse configured provider version"))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .with_context(|| {
-                format!("provider {provider_path:?} has no configured baseline version")
-            })?;
+        let baseline = Version::parse(&provider.minimum_version)
+            .with_context(|| format!("parse minimumVersion for provider {provider_path:?}"))?;
         let url = format!(
             "https://registry.terraform.io/v1/providers/{namespace}/{provider_type}/versions"
         );
@@ -133,7 +125,7 @@ pub fn newer_releases(
         }
         versions.sort_by(|left, right| left.0.cmp(&right.0));
         for (_, version) in versions {
-            releases.push(manifest::release(manifest, provider_path, &version, None)?);
+            releases.push(manifest::release(manifest, provider_path, &version)?);
         }
     }
 

@@ -33,13 +33,16 @@ pub fn run(
     let manifest = manifest::load(root)?;
     terraform::check_version(&manifest.terraform_cli_version)?;
 
-    let mut releases = manifest::releases(&manifest)?;
-    if let Some(provider) = provider_filter {
-        releases.retain(|release| release.provider_path == provider);
-    }
-    if let Some(version) = version_filter {
-        releases.retain(|release| release.provider_version == version);
-    }
+    let releases = if let Some(version) = version_filter {
+        let provider = provider_filter.context("--provider-version requires --provider")?;
+        vec![manifest::release(&manifest, provider, version)?]
+    } else {
+        let mut releases = manifest::releases(&manifest)?;
+        if let Some(provider) = provider_filter {
+            releases.retain(|release| release.provider_path == provider);
+        }
+        releases
+    };
     if releases.is_empty() {
         bail!("no configured provider releases matched the selection");
     }

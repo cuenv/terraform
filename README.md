@@ -1,6 +1,6 @@
 # Terraform provider CUE definitions
 
-A Rust generator for CUE definitions derived from Terraform provider schemas. The explicit provider set lives in `providers.cue` and contains the 100 listed Terraform Registry providers with the most cumulative downloads, ranked from a Registry metadata snapshot taken on 2026-09-27, plus any providers added explicitly. Each entry pins the latest stable release that provides a `linux_amd64` package.
+A Rust generator for CUE definitions derived from Terraform provider schemas. The explicit provider set lives in `providers.cue` and contains the 100 listed Terraform Registry providers with the most cumulative downloads, ranked from a Registry metadata snapshot taken on 2026-09-27, plus any providers added explicitly. Each entry has a `minimumVersion` set to a stable release that provides a `linux_amd64` package. The updater generates that baseline and checks newer stable releases published in the last 30 days.
 
 Provider paths follow the Terraform Registry address: `terraform/<namespace>/<type>`. For example, `terraform/hashicorp/aws` refers to `hashicorp/aws`. To add or remove providers, edit `providers.cue`.
 
@@ -38,10 +38,10 @@ Generated modules are written under `generated/<provider path>/<provider release
 
 ## Automation
 
-`.github/workflows/generate-provider-cue.yml` runs on pushes to `main`, every six hours, and on manual dispatch. It uses Actions cache for the generated-release cursor and checks the explicit provider list for new stable releases published in the last 30 days. Generated files and the cursor are uploaded as a 90-day workflow artifact.
+`.github/workflows/generate-provider-cue.yml` runs on pushes to `main`, every six hours, and on manual dispatch. It uses Actions cache for the generated-release cursor and checks the explicit provider list for stable releases published in the last 30 days that are newer than `minimumVersion`. Generated files and the cursor are uploaded as a 90-day workflow artifact.
 
 The workflow does not authenticate to or publish anything to the CUE Registry. It does not commit generated files.
 
 ## Schema coverage
 
-Generated definitions cover provider configuration, resources, data sources, ephemeral resources, and provider functions when present. Required fields and nested block count bounds become CUE constraints. Terraform sets are represented as CUE lists, so uniqueness is not enforced. Provider-side validators and cross-field rules absent from Terraform's exported schema cannot be represented. Unsupported schema variants fail generation rather than being silently widened.
+Generated definitions cover provider configuration, resources, data sources, ephemeral resources, list resources, actions, resource identities, state stores, and provider functions when present. Required fields and nested block count bounds become CUE constraints. Terraform sets are represented as CUE lists, so uniqueness is not enforced. Provider-side validators and cross-field rules absent from Terraform's exported schema cannot be represented. Unsupported schema variants fail generation rather than being silently widened.

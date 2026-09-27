@@ -10,6 +10,10 @@ pub struct Counts {
     pub resource_schemas: usize,
     pub data_source_schemas: usize,
     pub ephemeral_resource_schemas: usize,
+    pub list_resource_schemas: usize,
+    pub action_schemas: usize,
+    pub resource_identity_schemas: usize,
+    pub state_store_schemas: usize,
     pub functions: usize,
 }
 
@@ -47,6 +51,10 @@ pub fn render_provider(
     let resource_schemas = category(schema, "resource_schemas")?;
     let data_source_schemas = category(schema, "data_source_schemas")?;
     let ephemeral_schemas = category(schema, "ephemeral_resource_schemas")?;
+    let list_resource_schemas = category(schema, "list_resource_schemas")?;
+    let action_schemas = category(schema, "action_schemas")?;
+    let resource_identity_schemas = category(schema, "resource_identity_schemas")?;
+    let state_store_schemas = category(schema, "state_store_schemas")?;
     let functions = category(schema, "functions")?;
 
     render_schema_map(
@@ -70,6 +78,28 @@ pub fn render_provider(
         &mut uses_list_constraints,
         &mut lines,
     )?;
+    render_schema_map(
+        list_resource_schemas,
+        "ListResource",
+        &mut definitions,
+        &mut uses_list_constraints,
+        &mut lines,
+    )?;
+    render_schema_map(
+        action_schemas,
+        "Action",
+        &mut definitions,
+        &mut uses_list_constraints,
+        &mut lines,
+    )?;
+    render_identity_schemas(resource_identity_schemas, &mut definitions, &mut lines)?;
+    render_schema_map(
+        state_store_schemas,
+        "StateStore",
+        &mut definitions,
+        &mut uses_list_constraints,
+        &mut lines,
+    )?;
     render_functions(functions, &mut definitions, &mut lines)?;
 
     for (key, value) in schema
@@ -79,7 +109,13 @@ pub fn render_provider(
         if key.ends_with("_schemas")
             && !matches!(
                 key.as_str(),
-                "resource_schemas" | "data_source_schemas" | "ephemeral_resource_schemas"
+                "resource_schemas"
+                    | "data_source_schemas"
+                    | "ephemeral_resource_schemas"
+                    | "list_resource_schemas"
+                    | "action_schemas"
+                    | "resource_identity_schemas"
+                    | "state_store_schemas"
             )
             && value.is_object()
         {
@@ -95,6 +131,10 @@ pub fn render_provider(
         resource_schemas: resource_schemas.len(),
         data_source_schemas: data_source_schemas.len(),
         ephemeral_resource_schemas: ephemeral_schemas.len(),
+        list_resource_schemas: list_resource_schemas.len(),
+        action_schemas: action_schemas.len(),
+        resource_identity_schemas: resource_identity_schemas.len(),
+        state_store_schemas: state_store_schemas.len(),
         functions: functions.len(),
     };
     Ok((lines.join("\n").trim_end().to_owned() + "\n", counts))
@@ -133,6 +173,66 @@ fn render_schema_map(
             uses_list_constraints,
             lines,
         )?;
+        lines.push(String::new());
+    }
+    Ok(())
+}
+
+fn render_identity_schemas(
+    schemas: &serde_json::Map<String, Value>,
+    definitions: &mut HashSet<String>,
+    lines: &mut Vec<String>,
+) -> Result<()> {
+    for (name, schema) in schemas {
+        let definition = cue_definition_name("ResourceIdentity", name);
+        if !definitions.insert(definition.clone()) {
+            bail!("Terraform names collide after conversion to CUE definition {definition}");
+        }
+        let schema = schema
+            .as_object()
+            .with_context(|| format!("resource identity schema {name:?} must be an object"))?;
+        let attributes = schema
+            .get("attributes")
+            .map(as_object("identity attributes"))
+            .transpose()?
+            .cloned()
+            .unwrap_or_default();
+        let mut fields = Vec::new();
+        let mut names = HashSet::new();
+
+        for (attribute_name, attribute) in &attributes {
+            let attribute = attribute.as_object().with_context(|| {
+                format!("identity attribute {attribute_name:?} must be an object")
+            })?;
+            let required_for_import =
+                bool_field(attribute, "required_for_import")?.unwrap_or(false);
+            let optional_for_import =
+                bool_field(attribute, "optional_for_import")?.unwrap_or(false);
+            if required_for_import == optional_for_import {
+                bail!(
+                    "identity attribute {attribute_name:?} must set exactly one of required_for_import or optional_for_import"
+                );
+            }
+            let value = render_type(attribute.get("type").with_context(|| {
+                format!("identity attribute {attribute_name:?} is missing type")
+            })?)?;
+            let value = if optional_for_import {
+                format!("{value} | null")
+            } else {
+                value
+            };
+            push_field(
+                &mut fields,
+                &mut names,
+                attribute_name,
+                required_for_import,
+                &value,
+            )?;
+        }
+
+        lines.push(format!("{definition}: {{"));
+        lines.extend(fields.into_iter().map(|field| format!("    {field}")));
+        lines.push("}".to_owned());
         lines.push(String::new());
     }
     Ok(())
@@ -468,14 +568,102 @@ pub fn package_name(provider_path: &str) -> String {
             }
         })
         .collect();
+    const RESERVED: &[&str] = &[
+        "as", "break", "case", "continue", "default", "else", "false", "for", "func", "if",
+        "import", "in", "let", "null", "package", "range", "return", "select", "switch", "true",
+        "where", "with",
+    ];
     if sanitized
         .chars()
         .next()
         .is_some_and(|character| !character.is_ascii_alphabetic())
+        || RESERVED.contains(&sanitized.as_str())
     {
         format!("provider_{sanitized}")
     } else {
         sanitized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use cuengine::evaluate_cue_package;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::{package_name, render_provider};
+
+    #[test]
+    fn renders_all_provider_schema_categories() {
+        let schema = json!({
+            "provider": {"block": {"attributes": {}}},
+            "resource_schemas": {
+                "widget": {"block": {"attributes": {
+                    "name": {"type": "string", "required": true}
+                }}}
+            },
+            "data_source_schemas": {},
+            "ephemeral_resource_schemas": {},
+            "list_resource_schemas": {
+                "widgets": {"block": {"attributes": {
+                    "filter": {"type": "string", "optional": true}
+                }}}
+            },
+            "action_schemas": {
+                "create_widget": {"block": {"attributes": {
+                    "name": {"type": "string", "required": true}
+                }}}
+            },
+            "resource_identity_schemas": {
+                "widget": {"attributes": {
+                    "id": {"type": "string", "required_for_import": true},
+                    "region": {"type": "string", "optional_for_import": true}
+                }}
+            },
+            "state_store_schemas": {
+                "remote": {"block": {"attributes": {
+                    "endpoint": {"type": "string", "required": true}
+                }}}
+            },
+            "functions": {}
+        });
+        let (cue, counts) = render_provider(
+            "terraform/example/widget",
+            "example/widget",
+            "1.0.0",
+            &schema,
+            "hash",
+        )
+        .expect("all provider schema categories should render");
+
+        assert!(cue.contains("#ListResource_widgets"));
+        assert!(cue.contains("#Action_create_widget"));
+        assert!(cue.contains("#ResourceIdentity_widget"));
+        assert!(cue.contains("\"region\"?: string | null"));
+        assert!(cue.contains("#StateStore_remote"));
+        assert_eq!(counts.list_resource_schemas, 1);
+        assert_eq!(counts.action_schemas, 1);
+        assert_eq!(counts.resource_identity_schemas, 1);
+        assert_eq!(counts.state_store_schemas, 1);
+
+        let directory = tempdir().expect("temporary CUE package directory");
+        let module_root = directory.path();
+        fs::create_dir_all(module_root.join("cue.mod")).expect("create module metadata directory");
+        fs::write(
+            module_root.join("cue.mod/module.cue"),
+            "module: \"example.com/test@v0\"\nlanguage: version: \"v0.16.0\"\nsource: kind: \"self\"\n",
+        )
+        .expect("write module metadata");
+        fs::write(module_root.join("schema.cue"), cue).expect("write generated schema");
+        evaluate_cue_package(module_root, "widget")
+            .expect("cuengine should evaluate all generated schema categories");
+    }
+
+    #[test]
+    fn avoids_reserved_cue_package_names() {
+        assert_eq!(package_name("terraform/hashicorp/null"), "provider_null");
     }
 }
 

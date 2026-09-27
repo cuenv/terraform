@@ -20,13 +20,8 @@ pub struct Manifest {
 #[derive(Debug, Deserialize)]
 pub struct Provider {
     pub source: String,
-    pub versions: BTreeMap<String, Release>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Release {
-    #[serde(default)]
-    pub path_version: Option<String>,
+    #[serde(rename = "minimumVersion")]
+    pub minimum_version: String,
 }
 
 #[derive(Clone, Debug)]
@@ -50,19 +45,12 @@ pub fn releases(manifest: &Manifest) -> Result<Vec<ProviderRelease>> {
     let mut module_paths = HashSet::new();
 
     for (provider_path, provider) in &manifest.providers {
-        for (provider_version, configured_release) in &provider.versions {
-            let generated = release(
-                manifest,
-                provider_path,
-                provider_version,
-                configured_release.path_version.as_deref(),
-            )?;
-            let module_path = generated.module_path.clone();
-            if !module_paths.insert(module_path.clone()) {
-                bail!("duplicate CUE module path {module_path:?}");
-            }
-            result.push(generated);
+        let generated = release(manifest, provider_path, &provider.minimum_version)?;
+        let module_path = generated.module_path.clone();
+        if !module_paths.insert(module_path.clone()) {
+            bail!("duplicate CUE module path {module_path:?}");
         }
+        result.push(generated);
     }
     Ok(result)
 }
@@ -71,13 +59,13 @@ pub fn release(
     manifest: &Manifest,
     provider_path: &str,
     provider_version: &str,
-    path_version: Option<&str>,
 ) -> Result<ProviderRelease> {
+    parse_plain_version(provider_version, "Terraform provider version")?;
     let provider = manifest
         .providers
         .get(provider_path)
         .with_context(|| format!("unknown provider path {provider_path:?}"))?;
-    let path_version = path_version.unwrap_or(provider_version);
+    let path_version = provider_version;
     validate_module_segment(path_version).with_context(|| {
         format!("{provider_path}@{provider_version} has invalid path version {path_version:?}")
     })?;
@@ -118,24 +106,22 @@ fn validate(manifest: &Manifest) -> Result<()> {
     for (path, provider) in &manifest.providers {
         validate_path(path, "provider path")?;
         validate_source(&provider.source)?;
-        if provider.versions.is_empty() {
-            bail!("provider {path:?} needs at least one pinned version");
+        let minimum_version = parse_plain_version(&provider.minimum_version, "minimumVersion")?;
+        if !minimum_version.pre.is_empty() || !minimum_version.build.is_empty() {
+            bail!("minimumVersion for provider {path:?} must be a stable semantic version");
         }
-        for (provider_version, release) in &provider.versions {
-            parse_plain_version(provider_version, "Terraform provider version")?;
-            let path_version = release.path_version.as_deref().unwrap_or(provider_version);
-            validate_module_segment(path_version).with_context(|| {
-                format!(
-                    "{path}@{provider_version} has invalid path_version {path_version:?}; set a lowercase module path segment"
-                )
-            })?;
-            let module_path = format!(
-                "{}/{}/{}@v{}",
-                manifest.module_prefix, path, path_version, module_major
-            );
-            if module_path.len() > 128 {
-                bail!("CUE module path is longer than 128 characters: {module_path}");
-            }
+        validate_module_segment(&provider.minimum_version).with_context(|| {
+            format!(
+                "{path}@{} has invalid minimumVersion; set a lowercase module path segment",
+                provider.minimum_version
+            )
+        })?;
+        let module_path = format!(
+            "{}/{}/{}@v{}",
+            manifest.module_prefix, path, provider.minimum_version, module_major
+        );
+        if module_path.len() > 128 {
+            bail!("CUE module path is longer than 128 characters: {module_path}");
         }
     }
     releases(manifest)?;
