@@ -1,5 +1,5 @@
 [package]
-name = "pulumi-cue"
+name = "terraform-cue"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"

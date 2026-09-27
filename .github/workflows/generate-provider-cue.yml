@@ -1,6 +1,8 @@
 name: Generate Terraform provider CUE definitions
 
 on:
+  push:
+    branches: [main]
   schedule:
     - cron: "17 */6 * * *"
   workflow_dispatch:
@@ -16,9 +18,6 @@ jobs:
   generate:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    permissions:
-      contents: read
-      id-token: write
     outputs:
       has_updates: ${{ steps.plan.outputs.has_updates }}
     steps:
@@ -30,9 +29,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .provider-release-state.json
-          key: pulumi-cue-provider-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          key: terraform-cue-provider-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            pulumi-cue-provider-state-v1-
+            terraform-cue-provider-state-v1-
 
       - name: Initialize generated-release cursor
         run: |
@@ -48,22 +47,16 @@ jobs:
       - name: Build generator
         run: cargo build --locked --release
 
-      - name: Authenticate to CUE Registry
-        id: cue-registry
-        uses: cue-labs/registry-login-action@v1
-
       - name: Read Terraform CLI version
         id: terraform-version
-        run: echo "version=$(target/release/pulumi-cue terraform-version)" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(target/release/terraform-cue terraform-version)" >> "$GITHUB_OUTPUT"
 
       - name: Check for new provider releases
         id: plan
         shell: bash
-        env:
-          CUE_REGISTRY_TOKEN: ${{ steps.cue-registry.outputs.access_token }}
         run: |
           set -o pipefail
-          target/release/pulumi-cue update \
+          target/release/terraform-cue update \
             --state-file .provider-release-state.json \
             --dry-run | tee "$RUNNER_TEMP/provider-update-plan.txt"
           if grep -Eq '^would generate [1-9][0-9]* provider release' "$RUNNER_TEMP/provider-update-plan.txt"; then
@@ -79,12 +72,15 @@ jobs:
           terraform_wrapper: false
 
       - name: Generate new provider definitions
+        id: generate
         if: steps.plan.outputs.has_updates == 'true'
-        env:
-          CUE_REGISTRY_TOKEN: ${{ steps.cue-registry.outputs.access_token }}
+        continue-on-error: true
+        shell: bash
         run: |
-          target/release/pulumi-cue update \
-            --state-file .provider-release-state.json
+          set -o pipefail
+          target/release/terraform-cue update \
+            --state-file .provider-release-state.json \
+            2>&1 | tee "$RUNNER_TEMP/provider-generation.log"
 
       - name: Package generated files and release cursor
         if: steps.plan.outputs.has_updates == 'true'
@@ -100,29 +96,17 @@ jobs:
           path: |
             ${{ runner.temp }}/provider-cue-output.tar.gz
             ${{ runner.temp }}/provider-release-state.json
+            ${{ runner.temp }}/provider-generation.log
           retention-days: 90
           if-no-files-found: error
-
-      - uses: cue-lang/setup-cue@v1.0.0
-        if: steps.plan.outputs.has_updates == 'true'
-        with:
-          version: v0.16.0
-
-      - name: Publish generated provider modules
-        if: steps.plan.outputs.has_updates == 'true'
-        shell: bash
-        run: |
-          while IFS= read -r -d '' module_file; do
-            module_dir="${module_file%/cue.mod/module.cue}"
-            (
-              cd "$module_dir"
-              cue mod publish v0.0.1
-            )
-          done < <(find generated -type f -path '*/cue.mod/module.cue' -print0)
 
       - name: Cache generated-release cursor
         if: steps.plan.outputs.has_updates == 'true' && github.ref_name == github.event.repository.default_branch
         uses: actions/cache/save@v4
         with:
           path: .provider-release-state.json
-          key: pulumi-cue-provider-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          key: terraform-cue-provider-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Fail if one or more providers could not be generated
+        if: steps.generate.outcome == 'failure'
+        run: exit 1

@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 
-use crate::cue_registry;
 use crate::manifest::{self, ProviderRelease};
 use crate::registry;
 use crate::registry_http;
@@ -93,10 +92,6 @@ pub fn update(
     let mut pending = Vec::new();
     let mut already_complete = Vec::new();
     for release in candidates {
-        if cue_registry::is_published(&client, &release.module_path)? {
-            println!("already published {}", release.module_path);
-            continue;
-        }
         if state_contains(&state, &release) {
             continue;
         }
@@ -134,15 +129,38 @@ pub fn update(
 
     terraform::check_version(&manifest.terraform_cli_version)?;
     let generator_hash = generator_fingerprint(root)?;
-    for release in &pending {
-        generate_release(&manifest, release, &output, &snapshots, &generator_hash)?;
+    let pending_count = pending.len();
+    let mut generated_count = 0;
+    let mut failures = Vec::new();
+    for release in pending {
+        match generate_release(&manifest, &release, &output, &snapshots, &generator_hash) {
+            Ok(()) => {
+                state_insert(&mut state, &release);
+                generated_count += 1;
+            }
+            Err(error) => {
+                let message = format!(
+                    "{}@{}: {error:#}",
+                    release.provider_path, release.provider_version
+                );
+                eprintln!("failed to generate {message}");
+                failures.push(message);
+            }
+        }
     }
 
-    for release in pending.iter().chain(already_complete.iter()) {
-        state_insert(&mut state, release);
+    for release in already_complete {
+        state_insert(&mut state, &release);
     }
     write_state(&state_file, &state)?;
-    println!("generated {} new provider release(s)", pending.len());
+    println!("generated {generated_count} of {pending_count} new provider release(s)");
+    if !failures.is_empty() {
+        bail!(
+            "failed to generate {} of {pending_count} provider release(s): {}",
+            failures.len(),
+            failures.join("; ")
+        );
+    }
     Ok(())
 }
 
@@ -259,7 +277,7 @@ fn release_is_complete(
     for path in [&module_file, &schema_file, &raw_schema_file, &lockfile] {
         if !path.is_file() {
             bail!(
-                "{} has completion metadata but is missing {}; regenerate that pinned release with `pulumi-cue generate`",
+                "{} has completion metadata but is missing {}; regenerate that pinned release with `terraform-cue generate`",
                 release.module_path,
                 path.display()
             );
@@ -288,7 +306,7 @@ fn release_is_complete(
     ] {
         if metadata_value(&metadata, path) != Some(expected) {
             bail!(
-                "{} has metadata that does not match the configured {} ({expected:?}); regenerate explicitly with `pulumi-cue generate`",
+                "{} has metadata that does not match the configured {} ({expected:?}); regenerate explicitly with `terraform-cue generate`",
                 release.module_path,
                 path
             );
@@ -310,7 +328,7 @@ fn release_is_complete(
         let actual = sha256(&fs::read(path).with_context(|| format!("read {}", path.display()))?);
         if actual != expected {
             bail!(
-                "{} failed its {} integrity check; regenerate explicitly with `pulumi-cue generate`",
+                "{} failed its {} integrity check; regenerate explicitly with `terraform-cue generate`",
                 release.module_path,
                 field
             );

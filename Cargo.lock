@@ -774,7 +774,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pulumi-cue"
+name = "terraform-cue"
 version = "0.1.0"
 dependencies = [
  "anyhow",

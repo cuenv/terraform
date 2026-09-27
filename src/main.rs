@@ -1,4 +1,3 @@
-mod cue_registry;
 mod generate;
 mod manifest;
 mod registry;
@@ -14,7 +13,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "pulumi-cue",
+    name = "terraform-cue",
     about = "Fetch Terraform provider schemas and generate versioned CUE definition files"
 )]
 struct Cli {

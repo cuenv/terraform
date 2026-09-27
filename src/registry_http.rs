@@ -11,7 +11,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub fn client() -> Result<Client> {
     Client::builder()
-        .user_agent(concat!("pulumi-cue/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("terraform-cue/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .build()
