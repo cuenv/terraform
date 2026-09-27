@@ -1,0 +1,128 @@
+name: Generate Terraform provider CUE definitions
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: generate-terraform-provider-cue
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      has_updates: ${{ steps.plan.outputs.has_updates }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Restore generated-release cursor
+        uses: actions/cache/restore@v4
+        with:
+          path: .provider-release-state.json
+          key: pulumi-cue-provider-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            pulumi-cue-provider-state-v1-
+
+      - name: Initialize generated-release cursor
+        run: |
+          if [ ! -f .provider-release-state.json ]; then
+            printf '{"completed": {}}\n' > .provider-release-state.json
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+
+      - name: Build generator
+        run: cargo build --locked --release
+
+      - name: Authenticate to CUE Registry
+        id: cue-registry
+        uses: cue-labs/registry-login-action@v1
+
+      - name: Read Terraform CLI version
+        id: terraform-version
+        run: echo "version=$(target/release/pulumi-cue terraform-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Check for new provider releases
+        id: plan
+        shell: bash
+        env:
+          CUE_REGISTRY_TOKEN: ${{ steps.cue-registry.outputs.access_token }}
+        run: |
+          set -o pipefail
+          target/release/pulumi-cue update \
+            --state-file .provider-release-state.json \
+            --dry-run | tee "$RUNNER_TEMP/provider-update-plan.txt"
+          if grep -Eq '^would generate [1-9][0-9]* provider release' "$RUNNER_TEMP/provider-update-plan.txt"; then
+            echo "has_updates=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: hashicorp/setup-terraform@v4
+        if: steps.plan.outputs.has_updates == 'true'
+        with:
+          terraform_version: ${{ steps.terraform-version.outputs.version }}
+          terraform_wrapper: false
+
+      - name: Generate new provider definitions
+        if: steps.plan.outputs.has_updates == 'true'
+        env:
+          CUE_REGISTRY_TOKEN: ${{ steps.cue-registry.outputs.access_token }}
+        run: |
+          target/release/pulumi-cue update \
+            --state-file .provider-release-state.json
+
+      - name: Package generated files and release cursor
+        if: steps.plan.outputs.has_updates == 'true'
+        run: |
+          mkdir -p generated schema-snapshots
+          tar -czf "$RUNNER_TEMP/provider-cue-output.tar.gz" generated schema-snapshots
+          cp .provider-release-state.json "$RUNNER_TEMP/provider-release-state.json"
+
+      - uses: actions/upload-artifact@v7
+        if: steps.plan.outputs.has_updates == 'true'
+        with:
+          name: provider-cue-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/provider-cue-output.tar.gz
+            ${{ runner.temp }}/provider-release-state.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - uses: cue-lang/setup-cue@v1.0.0
+        if: steps.plan.outputs.has_updates == 'true'
+        with:
+          version: v0.16.0
+
+      - name: Publish generated provider modules
+        if: steps.plan.outputs.has_updates == 'true'
+        shell: bash
+        run: |
+          while IFS= read -r -d '' module_file; do
+            module_dir="${module_file%/cue.mod/module.cue}"
+            (
+              cd "$module_dir"
+              cue mod publish v0.0.1
+            )
+          done < <(find generated -type f -path '*/cue.mod/module.cue' -print0)
+
+      - name: Cache generated-release cursor
+        if: steps.plan.outputs.has_updates == 'true' && github.ref_name == github.event.repository.default_branch
+        uses: actions/cache/save@v4
+        with:
+          path: .provider-release-state.json
+          key: pulumi-cue-provider-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
