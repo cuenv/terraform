@@ -1,6 +1,6 @@
 # Terraform provider CUE definitions
 
-A Rust generator for CUE definitions derived from Terraform provider schemas. The explicit provider set lives in `providers.cue` and currently contains the 100 listed Terraform Registry providers with the most cumulative downloads, ranked from a Registry metadata snapshot taken on 2026-09-27. Each entry pins the latest stable release that provides a `linux_amd64` package.
+A Rust generator for CUE definitions derived from Terraform provider schemas. The explicit provider set lives in `providers.cue` and contains the 100 listed Terraform Registry providers with the most cumulative downloads, ranked from a Registry metadata snapshot taken on 2026-09-27, plus any providers added explicitly. Each entry pins the latest stable release that provides a `linux_amd64` package.
 
 Provider paths follow the Terraform Registry address: `terraform/<namespace>/<type>`. For example, `terraform/hashicorp/aws` refers to `hashicorp/aws`. To add or remove providers, edit `providers.cue`.
 

@@ -1,5 +1,5 @@
 // Copyright 2026 David Flanagan
-// Top 100 listed Terraform Registry providers by cumulative downloads.
+// Top 100 listed Terraform Registry providers by cumulative downloads, plus explicitly requested providers.
 // Baselines are the latest stable linux_amd64 releases available on 2026-09-27.
 package providers
 
@@ -508,5 +508,10 @@ providers: {
 	"terraform/buildkite/buildkite": {
 		source: "buildkite/buildkite"
 		versions: {"1.39.2": {}}
+	}
+	// Explicitly requested on 2026-09-27; downloads=2716063 tier=community
+	"terraform/infisical/infisical": {
+		source: "infisical/infisical"
+		versions: {"0.19.36": {}}
 	}
 }
