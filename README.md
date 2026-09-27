@@ -6,7 +6,7 @@ Provider paths follow the Terraform Registry address: `terraform/<namespace>/<ty
 
 ## Schema generation
 
-The Registry API provides release metadata and provider package download locations, but not a complete machine-readable provider schema. Schema generation uses the pinned Terraform CLI to install the exact provider release and call `terraform providers schema -json`. Rust handles release discovery, schema conversion, file output, and integrity metadata. `cuengine` evaluates and validates the generated CUE; the CUE CLI is not used.
+The Registry API provides release metadata and provider package download locations, but not a complete machine-readable provider schema. Schema generation uses the pinned Terraform CLI to install the exact provider release and call `terraform providers schema -json`. Rust handles release discovery, schema conversion, file output, and integrity metadata. `cuengine` evaluates and validates the generated CUE; the CUE CLI is not used for generation or validation.
 
 Requirements are Rust stable, Go 1.26 or newer, a C toolchain for `cuengine`, and Terraform CLI 1.16.4 for schema generation.
 
@@ -22,7 +22,7 @@ Generate one release:
 cargo run --locked -- generate --provider terraform/hashicorp/aws --provider-version 6.66.0
 ```
 
-Check for newer stable releases from the explicit provider list without installing providers or writing files:
+Check for newer stable releases from the explicit provider list without installing providers or generating CUE files:
 
 ```sh
 cargo run --locked -- update --dry-run
@@ -38,9 +38,9 @@ Generated modules are written under `generated/<provider path>/<provider release
 
 ## Automation
 
-`.github/workflows/generate-provider-cue.yml` runs on pushes to `main`, every six hours, and on manual dispatch. It uses Actions cache for the generated-release cursor and checks the explicit provider list for stable releases published in the last 30 days that are newer than `minimumVersion`. Generated files are temporary and are discarded when the workflow job ends.
+`.github/workflows/generate-provider-cue.yml` runs on pushes to `main`, every six hours, and on manual dispatch. Each run checks Terraform releases from the last 30 days and reads CUE Registry tags for every candidate module. It skips a release only when the matching `v<provider-version>` tag is already published. The Actions cache stores Rust build dependencies, `target`, and pending provider/version IDs; it never stores generated modules or schema snapshots.
 
-The workflow does not authenticate to or publish anything to the CUE Registry. It does not commit generated files.
+The workflow uses GitHub OIDC trusted publishing for the CUE Registry. Rust and `cuengine` generate and validate each missing module; the CUE CLI is used only for `cue mod publish`. Generated modules and schema snapshots live under the runner's temporary directory and are discarded when the job ends. Cached pending IDs keep failed releases eligible after the 30-day discovery window. The workflow checks the CUE Registry on every run and does not commit or upload generated files.
 
 ## Schema coverage
 

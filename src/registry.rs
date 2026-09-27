@@ -1,3 +1,4 @@
+pub(crate) mod http;
 use std::collections::{HashMap, HashSet};
 use std::env;
 
@@ -9,7 +10,6 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::manifest::{self, Manifest, ProviderRelease};
-use crate::registry_http;
 
 #[derive(Deserialize)]
 struct VersionsResponse {
@@ -70,7 +70,7 @@ pub fn newer_releases(
         let url = format!(
             "https://registry.terraform.io/v1/providers/{namespace}/{provider_type}/versions"
         );
-        let response: VersionsResponse = registry_http::get(client, &url, None)
+        let response: VersionsResponse = http::get(client, &url, None)
             .with_context(|| format!("fetch release versions for {}", provider.source))?
             .error_for_status()
             .with_context(|| {
@@ -140,7 +140,7 @@ fn provider_release_dates(
     let url = format!(
         "https://registry.terraform.io/v2/providers/{namespace}/{provider_type}?include=provider-versions"
     );
-    let response: ProviderDetailsResponse = registry_http::get(client, &url, None)
+    let response: ProviderDetailsResponse = http::get(client, &url, None)
         .with_context(|| format!("fetch provider release dates for {namespace}/{provider_type}"))?
         .error_for_status()
         .with_context(|| {

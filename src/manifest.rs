@@ -11,7 +11,6 @@ const CUEENGINE_LANGUAGE_VERSION: &str = "v0.16.0";
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
     pub module_prefix: String,
-    pub module_major: u64,
     pub cue_language_version: String,
     pub terraform_cli_version: String,
     pub providers: BTreeMap<String, Provider>,
@@ -30,7 +29,6 @@ pub struct ProviderRelease {
     pub source: String,
     pub provider_version: String,
     pub module_path: String,
-    pub path_version: String,
 }
 
 pub fn load(root: &Path) -> Result<Manifest> {
@@ -60,18 +58,14 @@ pub fn release(
     provider_path: &str,
     provider_version: &str,
 ) -> Result<ProviderRelease> {
-    parse_plain_version(provider_version, "Terraform provider version")?;
+    let version = parse_plain_version(provider_version, "Terraform provider version")?;
     let provider = manifest
         .providers
         .get(provider_path)
         .with_context(|| format!("unknown provider path {provider_path:?}"))?;
-    let path_version = provider_version;
-    validate_module_segment(path_version).with_context(|| {
-        format!("{provider_path}@{provider_version} has invalid path version {path_version:?}")
-    })?;
     let module_path = format!(
-        "{}/{}/{}@v{}",
-        manifest.module_prefix, provider_path, path_version, manifest.module_major
+        "{}/{}@v{}",
+        manifest.module_prefix, provider_path, version.major
     );
     if module_path.len() > 128 {
         bail!("CUE module path is longer than 128 characters: {module_path}");
@@ -81,13 +75,11 @@ pub fn release(
         source: provider.source.clone(),
         provider_version: provider_version.to_owned(),
         module_path,
-        path_version: path_version.to_owned(),
     })
 }
 
 fn validate(manifest: &Manifest) -> Result<()> {
     validate_module_prefix(&manifest.module_prefix)?;
-    let module_major = manifest.module_major;
     let cue_language = parse_v_version(&manifest.cue_language_version, "cue_language_version")?;
     let supported_language =
         parse_v_version(CUEENGINE_LANGUAGE_VERSION, "cuengine language version")?;
@@ -110,15 +102,9 @@ fn validate(manifest: &Manifest) -> Result<()> {
         if !minimum_version.pre.is_empty() || !minimum_version.build.is_empty() {
             bail!("minimumVersion for provider {path:?} must be a stable semantic version");
         }
-        validate_module_segment(&provider.minimum_version).with_context(|| {
-            format!(
-                "{path}@{} has invalid minimumVersion; set a lowercase module path segment",
-                provider.minimum_version
-            )
-        })?;
         let module_path = format!(
-            "{}/{}/{}@v{}",
-            manifest.module_prefix, path, provider.minimum_version, module_major
+            "{}/{}@v{}",
+            manifest.module_prefix, path, minimum_version.major
         );
         if module_path.len() > 128 {
             bail!("CUE module path is longer than 128 characters: {module_path}");
@@ -187,4 +173,43 @@ fn parse_v_version(value: &str, field: &str) -> Result<Version> {
         .strip_prefix('v')
         .with_context(|| format!("{field} must start with v"))?;
     parse_plain_version(version, field)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{Manifest, Provider, release};
+
+    #[test]
+    fn module_major_and_release_tag_follow_provider_version() {
+        let manifest = Manifest {
+            module_prefix: "github.com/cuenv/terraform".to_owned(),
+            cue_language_version: "v0.16.0".to_owned(),
+            terraform_cli_version: "1.16.4".to_owned(),
+            providers: BTreeMap::from([(
+                "terraform/cloudflare/cloudflare".to_owned(),
+                Provider {
+                    source: "cloudflare/cloudflare".to_owned(),
+                    minimum_version: "5.26.0".to_owned(),
+                },
+            )]),
+        };
+
+        let version_5 = release(&manifest, "terraform/cloudflare/cloudflare", "5.26.0")
+            .expect("Terraform provider release");
+        let version_6 = release(&manifest, "terraform/cloudflare/cloudflare", "6.0.0")
+            .expect("Terraform provider release");
+
+        assert_eq!(
+            version_5.module_path,
+            "github.com/cuenv/terraform/terraform/cloudflare/cloudflare@v5"
+        );
+        assert_eq!(
+            version_6.module_path,
+            "github.com/cuenv/terraform/terraform/cloudflare/cloudflare@v6"
+        );
+        assert_eq!(version_5.provider_version, "5.26.0");
+        assert_eq!(version_6.provider_version, "6.0.0");
+    }
 }

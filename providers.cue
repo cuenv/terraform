@@ -4,7 +4,6 @@
 package providers
 
 module_prefix:         "github.com/cuenv/terraform"
-module_major:          0
 cue_language_version:  "v0.16.0"
 terraform_cli_version: "1.16.4"
 

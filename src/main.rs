@@ -1,7 +1,7 @@
+mod cue;
 mod generate;
 mod manifest;
 mod registry;
-mod registry_http;
 mod schema;
 mod terraform;
 mod util;
@@ -34,7 +34,7 @@ enum Command {
         #[arg(long, default_value = "schema-snapshots")]
         snapshots: PathBuf,
     },
-    /// Generate newly released provider definitions and record processed versions.
+    /// Generate newly released definitions and optionally publish missing CUE Registry tags.
     Update {
         #[arg(long)]
         provider: Option<String>,
@@ -44,9 +44,12 @@ enum Command {
         snapshots: PathBuf,
         #[arg(long, default_value = ".provider-release-state.json")]
         state_file: PathBuf,
-        /// List missing releases without downloading Terraform providers or writing files.
+        /// List missing releases without generating CUE files; update pending release IDs.
         #[arg(long)]
         dry_run: bool,
+        /// Publish generated provider modules to the CUE Registry after validation.
+        #[arg(long)]
+        publish: bool,
     },
     /// Print the Terraform CLI version pinned in providers.cue.
     TerraformVersion,
@@ -75,6 +78,7 @@ fn main() -> Result<()> {
             snapshots,
             state_file,
             dry_run,
+            publish,
         } => generate::update(
             &root,
             provider.as_deref(),
@@ -82,6 +86,7 @@ fn main() -> Result<()> {
             &snapshots,
             &state_file,
             dry_run,
+            publish,
         ),
         Command::TerraformVersion => {
             let manifest = manifest::load(&root)?;
