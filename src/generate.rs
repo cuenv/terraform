@@ -95,15 +95,14 @@ pub fn update(
     let mut pending = Vec::new();
     let mut already_complete = Vec::new();
     for release in candidates {
-        if state_contains(&state, &release) {
-            continue;
-        }
         if release_is_complete(&manifest, &release, &output, &snapshots)? {
-            println!(
-                "already generated {}@{}",
-                release.provider_path, release.provider_version
-            );
-            already_complete.push(release);
+            if !state_contains(&state, &release) {
+                println!(
+                    "already generated {}@{}",
+                    release.provider_path, release.provider_version
+                );
+                already_complete.push(release);
+            }
         } else {
             pending.push(release);
         }
