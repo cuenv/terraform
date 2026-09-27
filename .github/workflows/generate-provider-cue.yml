@@ -25,16 +25,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Restore generated provider output cache
+      - name: Restore generated-release cursor
         uses: actions/cache/restore@v4
         with:
-          path: |
-            .provider-release-state.json
-            generated/
-            schema-snapshots/
-          key: terraform-cue-provider-cache-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .provider-release-state.json
+          key: terraform-cue-provider-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            terraform-cue-provider-cache-v2-
+            terraform-cue-provider-state-v1-
 
       - name: Initialize generated-release cursor
         run: |
@@ -85,33 +82,12 @@ jobs:
             --state-file .provider-release-state.json \
             2>&1 | tee "$RUNNER_TEMP/provider-generation.log"
 
-      - name: Package generated files and release cursor
-        if: steps.plan.outputs.has_updates == 'true'
-        run: |
-          mkdir -p generated schema-snapshots
-          tar -czf "$RUNNER_TEMP/provider-cue-output.tar.gz" generated schema-snapshots
-          cp .provider-release-state.json "$RUNNER_TEMP/provider-release-state.json"
-
-      - uses: actions/upload-artifact@v7
-        if: steps.plan.outputs.has_updates == 'true'
-        with:
-          name: provider-cue-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/provider-cue-output.tar.gz
-            ${{ runner.temp }}/provider-release-state.json
-            ${{ runner.temp }}/provider-generation.log
-          retention-days: 90
-          if-no-files-found: error
-
-      - name: Cache generated provider outputs
+      - name: Cache generated-release cursor
         if: steps.plan.outputs.has_updates == 'true' && github.ref_name == github.event.repository.default_branch
         uses: actions/cache/save@v4
         with:
-          path: |
-            .provider-release-state.json
-            generated/
-            schema-snapshots/
-          key: terraform-cue-provider-cache-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .provider-release-state.json
+          key: terraform-cue-provider-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Fail if one or more providers could not be generated
         if: steps.generate.outcome == 'failure'

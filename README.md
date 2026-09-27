@@ -38,7 +38,7 @@ Generated modules are written under `generated/<provider path>/<provider release
 
 ## Automation
 
-`.github/workflows/generate-provider-cue.yml` runs on pushes to `main`, every six hours, and on manual dispatch. It uses Actions cache for the generated-release cursor and checks the explicit provider list for stable releases published in the last 30 days that are newer than `minimumVersion`. Generated files and the cursor are uploaded as a 90-day workflow artifact.
+`.github/workflows/generate-provider-cue.yml` runs on pushes to `main`, every six hours, and on manual dispatch. It uses Actions cache for the generated-release cursor and checks the explicit provider list for stable releases published in the last 30 days that are newer than `minimumVersion`. Generated files are temporary and are discarded when the workflow job ends.
 
 The workflow does not authenticate to or publish anything to the CUE Registry. It does not commit generated files.
 
