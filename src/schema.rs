@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -33,7 +33,7 @@ pub fn render_provider(
         format!("package {package}"),
         String::new(),
     ];
-    let mut definitions = HashSet::new();
+    let mut definitions = HashMap::new();
     let mut uses_list_constraints = false;
     let provider_schema = schema
         .get("provider")
@@ -41,6 +41,8 @@ pub fn render_provider(
         .context("Terraform provider schema is missing the provider block")?;
     render_block_definition(
         "#ProviderConfig",
+        Some("provider"),
+        "provider configuration",
         provider_schema,
         &mut definitions,
         &mut uses_list_constraints,
@@ -157,37 +159,55 @@ fn empty_object() -> &'static serde_json::Map<String, Value> {
 fn render_schema_map(
     schemas: &serde_json::Map<String, Value>,
     prefix: &str,
-    definitions: &mut HashSet<String>,
+    definitions: &mut HashMap<String, String>,
     uses_list_constraints: &mut bool,
     lines: &mut Vec<String>,
 ) -> Result<()> {
+    if schemas.is_empty() {
+        return Ok(());
+    }
+    let mut names = HashMap::new();
+    let mut members = Vec::with_capacity(schemas.len());
     for (name, schema) in schemas {
-        let definition = cue_definition_name(prefix, name);
+        let cue_name = pascal_case(name)?;
+        register_name(&mut names, &cue_name, name, prefix)?;
+        let definition = cue_definition_name(prefix, name)?;
         let block = schema
             .as_object()
             .with_context(|| format!("schema {name:?} must be an object"))?;
         render_block_definition(
             &definition,
+            Some(name),
+            &format!("{prefix}.{name}"),
             block,
             definitions,
             uses_list_constraints,
             lines,
         )?;
+        members.push(format!("    {}: {definition}", cue_label(&cue_name)?));
         lines.push(String::new());
     }
+    lines.push(format!("{prefix}: {{"));
+    lines.extend(members);
+    lines.push("}".to_owned());
+    lines.push(String::new());
     Ok(())
 }
 
 fn render_identity_schemas(
     schemas: &serde_json::Map<String, Value>,
-    definitions: &mut HashSet<String>,
+    definitions: &mut HashMap<String, String>,
     lines: &mut Vec<String>,
 ) -> Result<()> {
+    if schemas.is_empty() {
+        return Ok(());
+    }
+    let mut names = HashMap::new();
+    let mut members = Vec::with_capacity(schemas.len());
     for (name, schema) in schemas {
-        let definition = cue_definition_name("ResourceIdentity", name);
-        if !definitions.insert(definition.clone()) {
-            bail!("Terraform names collide after conversion to CUE definition {definition}");
-        }
+        let cue_name = pascal_case(name)?;
+        register_name(&mut names, &cue_name, name, "ResourceIdentity")?;
+        let definition = cue_definition_name("ResourceIdentity", name)?;
         let schema = schema
             .as_object()
             .with_context(|| format!("resource identity schema {name:?} must be an object"))?;
@@ -198,7 +218,8 @@ fn render_identity_schemas(
             .cloned()
             .unwrap_or_default();
         let mut fields = Vec::new();
-        let mut names = HashSet::new();
+        let mut field_names = HashMap::new();
+        let schema_path = format!("ResourceIdentity.{name}");
 
         for (attribute_name, attribute) in &attributes {
             let attribute = attribute.as_object().with_context(|| {
@@ -213,9 +234,13 @@ fn render_identity_schemas(
                     "identity attribute {attribute_name:?} must set exactly one of required_for_import or optional_for_import"
                 );
             }
-            let value = render_type(attribute.get("type").with_context(|| {
-                format!("identity attribute {attribute_name:?} is missing type")
-            })?)?;
+            let field_path = format!("{schema_path}.{attribute_name}");
+            let value = render_type(
+                attribute.get("type").with_context(|| {
+                    format!("identity attribute {attribute_name:?} is missing type")
+                })?,
+                &field_path,
+            )?;
             let value = if optional_for_import {
                 format!("{value} | null")
             } else {
@@ -223,37 +248,47 @@ fn render_identity_schemas(
             };
             push_field(
                 &mut fields,
-                &mut names,
+                &mut field_names,
                 attribute_name,
+                &schema_path,
                 required_for_import,
                 &value,
             )?;
         }
 
+        insert_definition(definitions, &definition, &schema_path)?;
         lines.push(format!("{definition}: {{"));
+        lines.push(format!("    {}", terraform_attribute(name)?));
         lines.extend(fields.into_iter().map(|field| format!("    {field}")));
         lines.push("}".to_owned());
         lines.push(String::new());
+        members.push(format!("    {}: {definition}", cue_label(&cue_name)?));
     }
+    lines.push("ResourceIdentity: {".to_owned());
+    lines.extend(members);
+    lines.push("}".to_owned());
+    lines.push(String::new());
     Ok(())
 }
 
 fn render_block_definition(
     name: &str,
+    terraform_name: Option<&str>,
+    schema_path: &str,
     schema: &serde_json::Map<String, Value>,
-    definitions: &mut HashSet<String>,
+    definitions: &mut HashMap<String, String>,
     uses_list_constraints: &mut bool,
     lines: &mut Vec<String>,
 ) -> Result<()> {
-    if !definitions.insert(name.to_owned()) {
-        bail!("Terraform names collide after conversion to CUE definition {name}");
-    }
-    let block = schema
-        .get("block")
-        .and_then(Value::as_object)
-        .with_context(|| format!("schema {name} does not contain a block object"))?;
-    let fields = render_fields(block, uses_list_constraints)?;
+    insert_definition(definitions, name, schema_path)?;
+    let Some(block) = schema.get("block").and_then(Value::as_object) else {
+        bail!("schema {name} does not contain a block object");
+    };
+    let fields = render_fields(block, schema_path, uses_list_constraints)?;
     lines.push(format!("{name}: {{"));
+    if let Some(terraform_name) = terraform_name {
+        lines.push(format!("    {}", terraform_attribute(terraform_name)?));
+    }
     lines.extend(fields.into_iter().map(|field| format!("    {field}")));
     lines.push("}".to_owned());
     Ok(())
@@ -261,6 +296,7 @@ fn render_block_definition(
 
 fn render_fields(
     block: &serde_json::Map<String, Value>,
+    schema_path: &str,
     uses_list_constraints: &mut bool,
 ) -> Result<Vec<String>> {
     let attributes = block
@@ -276,7 +312,7 @@ fn render_fields(
         .cloned()
         .unwrap_or_default();
     let mut fields = Vec::new();
-    let mut names = HashSet::new();
+    let mut names = HashMap::new();
 
     for (name, attribute) in &attributes {
         let attribute = attribute
@@ -285,10 +321,11 @@ fn render_fields(
         if !input_attribute(name, attribute)? {
             continue;
         }
+        let field_path = format!("{schema_path}.{name}");
         let required = bool_field(attribute, "required")?.unwrap_or(false);
-        let value = render_attribute(attribute, uses_list_constraints)
-            .with_context(|| format!("attribute {name:?}"))?;
-        push_field(&mut fields, &mut names, name, required, &value)?;
+        let value = render_attribute(attribute, &field_path, uses_list_constraints)
+            .with_context(|| format!("attribute {field_path:?}"))?;
+        push_field(&mut fields, &mut names, name, schema_path, required, &value)?;
     }
 
     for (name, nested) in &block_types {
@@ -296,11 +333,12 @@ fn render_fields(
             .as_object()
             .with_context(|| format!("Terraform block type {name:?} must be an object"))?;
         let mode = string_field(nested, "nesting_mode")?.unwrap_or("single");
+        let field_path = format!("{schema_path}.{name}");
         let block = nested
             .get("block")
             .and_then(Value::as_object)
             .with_context(|| format!("Terraform block type {name:?} has no block object"))?;
-        let value = render_block_type(block, uses_list_constraints)?;
+        let value = render_block_type(block, &field_path, uses_list_constraints)?;
         let min = bound(nested.get("min_items"), 0, "min_items")?;
         let max = optional_bound(nested.get("max_items"), "max_items")?;
         let value = match mode {
@@ -309,7 +347,7 @@ fn render_fields(
             "single" => value,
             other => bail!("unsupported Terraform block nesting mode {other:?}"),
         };
-        push_field(&mut fields, &mut names, name, min > 0, &value)?;
+        push_field(&mut fields, &mut names, name, schema_path, min > 0, &value)?;
     }
     Ok(fields)
 }
@@ -330,14 +368,18 @@ fn input_attribute(name: &str, attribute: &serde_json::Map<String, Value>) -> Re
 
 fn render_attribute(
     attribute: &serde_json::Map<String, Value>,
+    path: &str,
     uses_list_constraints: &mut bool,
 ) -> Result<String> {
     let value = match attribute.get("nested_type") {
-        Some(Value::Null) | None => render_type(attribute.get("type").context("missing type")?)?,
+        Some(Value::Null) | None => {
+            render_type(attribute.get("type").context("missing type")?, path)?
+        }
         Some(nested) => render_nested_type(
             nested
                 .as_object()
                 .context("nested_type must be an object")?,
+            path,
             uses_list_constraints,
         )?,
     };
@@ -350,6 +392,7 @@ fn render_attribute(
 
 fn render_nested_type(
     nested: &serde_json::Map<String, Value>,
+    path: &str,
     uses_list_constraints: &mut bool,
 ) -> Result<String> {
     let mode = string_field(nested, "nesting_mode")?.unwrap_or("single");
@@ -369,7 +412,7 @@ fn render_nested_type(
                 .unwrap_or(Value::Object(serde_json::Map::new())),
         ),
     ]);
-    let value = render_block_type(&object, uses_list_constraints)?;
+    let value = render_block_type(&object, path, uses_list_constraints)?;
     match mode {
         "list" | "set" => render_list_type(
             &value,
@@ -385,9 +428,10 @@ fn render_nested_type(
 
 fn render_block_type(
     block: &serde_json::Map<String, Value>,
+    path: &str,
     uses_list_constraints: &mut bool,
 ) -> Result<String> {
-    let fields = render_fields(block, uses_list_constraints)?;
+    let fields = render_fields(block, path, uses_list_constraints)?;
     if fields.is_empty() {
         Ok("{}".to_owned())
     } else {
@@ -395,7 +439,7 @@ fn render_block_type(
     }
 }
 
-fn render_type(value: &Value) -> Result<String> {
+fn render_type(value: &Value, path: &str) -> Result<String> {
     match value {
         Value::String(kind) => match kind.as_str() {
             "bool" => Ok("bool".to_owned()),
@@ -409,12 +453,13 @@ fn render_type(value: &Value) -> Result<String> {
                 .as_str()
                 .context("Terraform collection type name must be a string")?;
             match kind {
-                "list" | "set" if values.len() == 2 => {
-                    Ok(format!("[...({})]", nullable(&render_type(&values[1])?)))
-                }
+                "list" | "set" if values.len() == 2 => Ok(format!(
+                    "[...({})]",
+                    nullable(&render_type(&values[1], &format!("{path}[]"))?)
+                )),
                 "map" if values.len() == 2 => Ok(format!(
                     "{{[string]: {}}}",
-                    nullable(&render_type(&values[1])?)
+                    nullable(&render_type(&values[1], &format!("{path}[*]"))?)
                 )),
                 "tuple" if values.len() == 2 => {
                     let elements = values[1]
@@ -424,7 +469,11 @@ fn render_type(value: &Value) -> Result<String> {
                         "[{}]",
                         elements
                             .iter()
-                            .map(|value| render_type(value).map(|value| nullable(&value)))
+                            .enumerate()
+                            .map(|(index, value)| {
+                                render_type(value, &format!("{path}[{index}]"))
+                                    .map(|value| nullable(&value))
+                            })
                             .collect::<Result<Vec<_>>>()?
                             .join(", ")
                     ))
@@ -434,11 +483,23 @@ fn render_type(value: &Value) -> Result<String> {
                         .as_object()
                         .context("Terraform object type must contain an object")?;
                     let mut rendered = Vec::new();
+                    let mut names = HashMap::new();
                     for (name, value) in fields {
+                        let field_path = format!("{path}.{name}");
+                        let cue_name = camel_case(name, false).with_context(|| {
+                            format!("convert Terraform object field {field_path:?}")
+                        })?;
+                        register_name(
+                            &mut names,
+                            &cue_name,
+                            name,
+                            &format!("object fields in {path}"),
+                        )?;
                         rendered.push(format!(
-                            "{}!: {}",
-                            cue_label(name)?,
-                            nullable(&render_type(value)?)
+                            "{}!: {} {}",
+                            cue_label(&cue_name)?,
+                            nullable(&render_type(value, &field_path)?),
+                            terraform_attribute(name)?,
                         ));
                     }
                     if rendered.is_empty() {
@@ -480,14 +541,15 @@ fn render_list_type(
 
 fn render_functions(
     functions: &serde_json::Map<String, Value>,
-    definitions: &mut HashSet<String>,
+    definitions: &mut HashMap<String, String>,
     lines: &mut Vec<String>,
 ) -> Result<()> {
+    let mut names = HashMap::new();
+    let mut members = Vec::with_capacity(functions.len());
     for (name, function) in functions {
-        let definition = cue_definition_name("Function", name);
-        if !definitions.insert(definition.clone()) {
-            bail!("Terraform names collide after conversion to CUE definition {definition}");
-        }
+        let cue_name = pascal_case(name)?;
+        register_name(&mut names, &cue_name, name, "Function")?;
+        let definition = cue_definition_name("Function", name)?;
         let function = function
             .as_object()
             .with_context(|| format!("Terraform function {name:?} must be an object"))?;
@@ -499,61 +561,164 @@ fn render_functions(
                 .clone(),
         };
         let mut arguments = Vec::new();
-        for parameter in parameters {
-            arguments.push(render_parameter(&parameter)?);
+        for (index, parameter) in parameters.iter().enumerate() {
+            arguments.push(render_parameter(
+                parameter,
+                &format!("function {name} argument {index}"),
+            )?);
         }
         if let Some(variadic) = function.get("variadic_parameter") {
             if !variadic.is_null() {
-                arguments.push(format!("...({})", render_parameter(variadic)?));
+                arguments.push(format!(
+                    "...({})",
+                    render_parameter(variadic, &format!("function {name} variadic argument"))?
+                ));
             }
         }
         let return_type = render_type(
             function
                 .get("return_type")
                 .context("function missing return_type")?,
+            &format!("function {name} return"),
         )?;
+        insert_definition(definitions, &definition, &format!("Function.{name}"))?;
         lines.push(format!("{definition}: {{"));
+        lines.push(format!("    {}", terraform_attribute(name)?));
         lines.push(format!("    arguments: [{}]", arguments.join(", ")));
         lines.push(format!("    returns: {return_type}"));
         lines.push("}".to_owned());
         lines.push(String::new());
+        members.push(format!("    {}: {definition}", cue_label(&cue_name)?));
     }
+    lines.push("Function: {".to_owned());
+    lines.extend(members);
+    lines.push("}".to_owned());
+    lines.push(String::new());
     Ok(())
 }
 
-fn render_parameter(parameter: &Value) -> Result<String> {
+fn render_parameter(parameter: &Value, path: &str) -> Result<String> {
     let parameter = parameter
         .as_object()
         .context("Terraform function parameter must be an object")?;
-    let mut result = render_type(parameter.get("type").context("parameter missing type")?)?;
+    let mut result = render_type(
+        parameter.get("type").context("parameter missing type")?,
+        path,
+    )?;
     if bool_field(parameter, "is_nullable")?.unwrap_or(false) {
         result = nullable(&result);
     }
     Ok(result)
 }
 
-fn cue_definition_name(prefix: &str, name: &str) -> String {
-    let suffix: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '_' {
-                character
+fn cue_definition_name(prefix: &str, name: &str) -> Result<String> {
+    Ok(format!("_#{prefix}Schema{}", pascal_case(name)?))
+}
+
+fn pascal_case(name: &str) -> Result<String> {
+    camel_case(name, true)
+}
+
+fn camel_case(name: &str, uppercase_first: bool) -> Result<String> {
+    let words = name
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty());
+    let mut result = String::new();
+    for (index, word) in words.enumerate() {
+        if index == 0 {
+            result.push_str(&lower_camel_word(word));
+        } else {
+            result.push_str(&title_word(word));
+        }
+    }
+    if result.is_empty() {
+        bail!("Terraform name {name:?} has no alphanumeric characters");
+    }
+    if uppercase_first {
+        result = capitalize_first(&result);
+    }
+    Ok(result)
+}
+
+fn lower_camel_word(word: &str) -> String {
+    let characters: Vec<char> = word.chars().collect();
+    let uppercase_prefix = characters
+        .iter()
+        .take_while(|character| character.is_uppercase())
+        .count();
+    let next_is_lowercase = characters
+        .get(uppercase_prefix)
+        .is_some_and(|character| character.is_lowercase());
+    let lowercase_count = if uppercase_prefix == characters.len() || !next_is_lowercase {
+        uppercase_prefix.max(1)
+    } else if uppercase_prefix > 1 {
+        uppercase_prefix - 1
+    } else {
+        1
+    };
+
+    characters
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, character)| {
+            if index < lowercase_count {
+                character.to_lowercase().collect::<Vec<_>>()
             } else {
-                '_'
+                vec![character]
             }
         })
-        .collect();
-    let suffix = if suffix.is_empty()
-        || suffix
-            .chars()
-            .next()
-            .is_some_and(|character| character.is_ascii_digit())
-    {
-        format!("_{suffix}")
-    } else {
-        suffix
+        .collect()
+}
+
+fn title_word(word: &str) -> String {
+    let mut characters = word.chars();
+    let Some(first) = characters.next() else {
+        return String::new();
     };
-    format!("#{prefix}_{suffix}")
+    let mut result = first.to_uppercase().collect::<String>();
+    result.push_str(&characters.as_str().to_lowercase());
+    result
+}
+
+fn capitalize_first(word: &str) -> String {
+    let mut characters = word.chars();
+    let Some(first) = characters.next() else {
+        return String::new();
+    };
+    let mut result = first.to_uppercase().collect::<String>();
+    result.push_str(characters.as_str());
+    result
+}
+
+fn register_name(
+    names: &mut HashMap<String, String>,
+    cue_name: &str,
+    terraform_name: &str,
+    scope: &str,
+) -> Result<()> {
+    if let Some(previous) = names.insert(cue_name.to_owned(), terraform_name.to_owned()) {
+        bail!(
+            "Terraform {scope} names {previous:?} and {terraform_name:?} collide after case conversion to CUE name {cue_name:?}"
+        );
+    }
+    Ok(())
+}
+
+fn insert_definition(
+    definitions: &mut HashMap<String, String>,
+    definition: &str,
+    terraform_name: &str,
+) -> Result<()> {
+    if let Some(previous) = definitions.insert(definition.to_owned(), terraform_name.to_owned()) {
+        bail!(
+            "Terraform schema names {previous:?} and {terraform_name:?} collide at CUE definition {definition}"
+        );
+    }
+    Ok(())
+}
+
+fn terraform_attribute(name: &str) -> Result<String> {
+    Ok(format!("@terraform(name={})", serde_json::to_string(name)?))
 }
 
 pub fn package_name(provider_path: &str) -> String {
@@ -601,7 +766,11 @@ mod tests {
             "provider": {"block": {"attributes": {}}},
             "resource_schemas": {
                 "widget": {"block": {"attributes": {
-                    "name": {"type": "string", "required": true}
+                    "name": {"type": "string", "required": true},
+                    "display_name": {"type": "string", "optional": true},
+                    "settings": {"type": ["object", {
+                        "directory_permission": "string"
+                    }], "required": true}
                 }}}
             },
             "data_source_schemas": {},
@@ -638,11 +807,17 @@ mod tests {
         )
         .expect("all provider schema categories should render");
 
-        assert!(cue.contains("#ListResource_widgets"));
-        assert!(cue.contains("#Action_create_widget"));
-        assert!(cue.contains("#ResourceIdentity_widget"));
-        assert!(cue.contains("\"region\"?: string | null"));
-        assert!(cue.contains("#StateStore_remote"));
+        assert!(cue.contains("_#ListResourceSchemaWidgets"));
+        assert!(cue.contains("_#ActionSchemaCreateWidget"));
+        assert!(cue.contains("_#ResourceIdentitySchemaWidget"));
+        assert!(cue.contains("\"region\"?: string | null @terraform(name=\"region\")"));
+        assert!(cue.contains("_#StateStoreSchemaRemote"));
+        assert!(cue.contains("Resource: {"));
+        assert!(cue.contains("\"Widget\": _#ResourceSchemaWidget"));
+        assert!(cue.contains("\"displayName\"?: string | null @terraform(name=\"display_name\")"));
+        assert!(cue.contains(
+            "\"directoryPermission\"!: (string | null) @terraform(name=\"directory_permission\")"
+        ));
         assert_eq!(counts.list_resource_schemas, 1);
         assert_eq!(counts.action_schemas, 1);
         assert_eq!(counts.resource_identity_schemas, 1);
@@ -677,16 +852,21 @@ fn nullable(value: &str) -> String {
 
 fn push_field(
     fields: &mut Vec<String>,
-    names: &mut HashSet<String>,
+    names: &mut HashMap<String, String>,
     name: &str,
+    schema_path: &str,
     required: bool,
     value: &str,
 ) -> Result<()> {
-    if !names.insert(name.to_owned()) {
-        bail!("Terraform block repeats field name {name:?}");
-    }
+    let cue_name = camel_case(name, false)
+        .with_context(|| format!("convert Terraform field {name:?} in {schema_path}"))?;
+    register_name(names, &cue_name, name, &format!("fields in {schema_path}"))?;
     let marker = if required { "!" } else { "?" };
-    fields.push(format!("{}{marker}: {value}", cue_label(name)?));
+    fields.push(format!(
+        "{}{marker}: {value} {}",
+        cue_label(&cue_name)?,
+        terraform_attribute(name)?
+    ));
     Ok(())
 }
 

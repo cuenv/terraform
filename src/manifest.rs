@@ -6,6 +6,8 @@ use cuengine::evaluate_cue_package_typed;
 use semver::Version;
 use serde::Deserialize;
 
+use crate::cue::registry as cue_registry;
+
 const CUEENGINE_LANGUAGE_VERSION: &str = "v0.16.0";
 
 #[derive(Debug, Deserialize)]
@@ -29,6 +31,7 @@ pub struct ProviderRelease {
     pub source: String,
     pub provider_version: String,
     pub module_path: String,
+    pub module_version: String,
 }
 
 pub fn load(root: &Path) -> Result<Manifest> {
@@ -75,6 +78,7 @@ pub fn release(
         source: provider.source.clone(),
         provider_version: provider_version.to_owned(),
         module_path,
+        module_version: cue_registry::release_tag(provider_version),
     })
 }
 
@@ -182,9 +186,9 @@ mod tests {
     use super::{Manifest, Provider, release};
 
     #[test]
-    fn module_major_and_release_tag_follow_provider_version() {
+    fn module_major_and_tag_follow_provider_version() {
         let manifest = Manifest {
-            module_prefix: "github.com/cuenv/terraform".to_owned(),
+            module_prefix: "ghcr.io/cuenv".to_owned(),
             cue_language_version: "v0.16.0".to_owned(),
             terraform_cli_version: "1.16.4".to_owned(),
             providers: BTreeMap::from([(
@@ -203,13 +207,15 @@ mod tests {
 
         assert_eq!(
             version_5.module_path,
-            "github.com/cuenv/terraform/terraform/cloudflare/cloudflare@v5"
+            "ghcr.io/cuenv/terraform/cloudflare/cloudflare@v5"
         );
         assert_eq!(
             version_6.module_path,
-            "github.com/cuenv/terraform/terraform/cloudflare/cloudflare@v6"
+            "ghcr.io/cuenv/terraform/cloudflare/cloudflare@v6"
         );
         assert_eq!(version_5.provider_version, "5.26.0");
         assert_eq!(version_6.provider_version, "6.0.0");
+        assert_eq!(version_5.module_version, "v5.26.0");
+        assert_eq!(version_6.module_version, "v6.0.0");
     }
 }

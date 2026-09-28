@@ -6,7 +6,6 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use cuengine::evaluate_cue_package;
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
@@ -26,6 +25,8 @@ struct ReleaseState {
     completed: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     pending: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default)]
+    published: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 pub fn run(
@@ -61,25 +62,44 @@ pub fn run(
     Ok(())
 }
 
+pub fn registry_tags(root: &Path) -> Result<()> {
+    let manifest = manifest::load(root)?;
+    let release = manifest::releases(&manifest)?
+        .into_iter()
+        .next()
+        .context("providers.cue does not configure any provider releases")?;
+    let username = std::env::var("GHCR_USERNAME").unwrap_or_default();
+    let password = std::env::var("GHCR_TOKEN").unwrap_or_default();
+    if username.is_empty() != password.is_empty() {
+        bail!("GHCR_USERNAME and GHCR_TOKEN must either both be set or both be empty");
+    }
+    let client = http::client()?;
+    let tags = cue_registry::published_tags(&client, &release.module_path, &username, &password)?;
+    let mut tags = tags.into_iter().collect::<Vec<_>>();
+    tags.sort();
+    println!("{}", serde_json::to_string(&tags)?);
+    Ok(())
+}
+
 pub fn update(
     root: &Path,
     provider_filter: Option<&str>,
     output: &Path,
     snapshots: &Path,
     state_file: &Path,
+    published_tags_file: Option<&Path>,
     dry_run: bool,
-    publish: bool,
+    defer_publish: bool,
 ) -> Result<()> {
     let manifest = manifest::load(root)?;
     let output = rooted_path(root, output);
     let snapshots = rooted_path(root, snapshots);
     let state_file = rooted_path(root, state_file);
     let mut state = load_state(&state_file)?;
-    let registry_token = if publish {
-        Some(std::env::var("CUE_REGISTRY_TOKEN").context("--publish requires CUE_REGISTRY_TOKEN")?)
-    } else {
-        None
-    };
+    let published_tags = published_tags_file
+        .map(read_published_tags)
+        .transpose()?
+        .unwrap_or_default();
 
     let mut candidates = manifest::releases(&manifest)?;
     if let Some(provider) = provider_filter {
@@ -88,9 +108,8 @@ pub fn update(
             bail!("provider {provider:?} is not configured in providers.cue");
         }
     }
-    if publish {
-        candidates.extend(pending_releases(&manifest, &state, provider_filter)?);
-    }
+    candidates.extend(pending_releases(&manifest, &state, provider_filter)?);
+    candidates.extend(published_releases(&manifest, &state, provider_filter)?);
     let client = http::client()?;
     candidates.extend(registry::newer_releases(
         &client,
@@ -106,74 +125,27 @@ pub fn update(
         left.provider_path == right.provider_path && left.provider_version == right.provider_version
     });
 
-    if publish {
-        let token = registry_token
-            .as_deref()
-            .context("--publish requires CUE_REGISTRY_TOKEN")?;
-        let pending = unpublished_releases(&client, &candidates, token)?;
-        remember_pending(&mut state, &pending, provider_filter);
-        write_state(&state_file, &state)?;
-        if dry_run {
-            if pending.is_empty() {
-                println!("up to date: no unpublished provider releases");
-            } else {
-                println!("would publish {} provider release(s)", pending.len());
-                for release in pending {
-                    println!("{}@{}", release.module_path, release.provider_version);
-                }
-            }
-            return Ok(());
-        }
-        if pending.is_empty() {
-            println!("up to date: no unpublished provider releases");
-            return Ok(());
-        }
-
-        terraform::check_version(&manifest.terraform_cli_version)?;
-        let generator_hash = generator_fingerprint(root)?;
-        let pending_count = pending.len();
-        let mut published_count = 0;
-        let mut failures = Vec::new();
-        for release in pending {
-            let module_root = module_root(&output, &release);
-            let result =
-                generate_release(&manifest, &release, &output, &snapshots, &generator_hash)
-                    .and_then(|()| publish_module(&module_root, &release));
-            match result {
-                Ok(()) => {
-                    forget_pending(&mut state, &release);
-                    published_count += 1;
-                }
-                Err(error) => {
-                    let message = format!(
-                        "{}@{}: {error:#}",
-                        release.provider_path, release.provider_version
-                    );
-                    eprintln!("failed to generate or publish {message}");
-                    failures.push(message);
-                }
-            }
-        }
-
-        write_state(&state_file, &state)?;
-        println!("published {published_count} of {pending_count} provider release(s)");
-        if !failures.is_empty() {
-            bail!(
-                "failed to generate or publish {} of {pending_count} provider release(s): {}",
-                failures.len(),
-                failures.join("; ")
-            );
-        }
-        return Ok(());
-    }
+    let generator_hash = generator_fingerprint(root)?;
 
     let mut pending = Vec::new();
     let mut already_complete = Vec::new();
     for release in candidates {
-        if state_contains(&state, &release) {
+        let tag = cue_registry::registry_tag(&release.module_path, &release.module_version)?;
+        if published_tags_file.is_some() {
+            if published_tags.contains(&tag) {
+                if !dry_run {
+                    state_mark_published(&mut state, &release);
+                }
+                continue;
+            }
+            state_forget_published(&mut state, &release);
+        } else if state_is_published(&state, &release) {
             continue;
         }
-        if release_is_complete(&manifest, &release, &output, &snapshots)? {
+        if published_tags_file.is_none() && state_contains(&state, &release, &generator_hash) {
+            continue;
+        }
+        if release_is_complete(&manifest, &release, &output, &snapshots, &generator_hash)? {
             println!(
                 "already generated {}@{}",
                 release.provider_path, release.provider_version
@@ -185,35 +157,59 @@ pub fn update(
     }
 
     if dry_run {
-        if pending.is_empty() {
+        let publishable = if defer_publish {
+            already_complete.len()
+        } else {
+            0
+        };
+        if pending.is_empty() && publishable == 0 {
             println!("up to date: no new provider releases");
         } else {
-            println!("would generate {} provider release(s)", pending.len());
+            if !pending.is_empty() {
+                println!("would generate {} provider release(s)", pending.len());
+            }
             for release in pending {
                 println!("{}@{}", release.provider_path, release.provider_version);
+            }
+            if publishable > 0 {
+                println!("would publish {publishable} previously generated provider release(s)");
+                for release in already_complete {
+                    println!("{}@{}", release.provider_path, release.provider_version);
+                }
             }
         }
         return Ok(());
     }
 
-    if pending.is_empty() {
-        for release in already_complete {
-            state_insert(&mut state, &release);
+    for release in &pending {
+        state_pending_insert(&mut state, release);
+    }
+    for release in &already_complete {
+        if defer_publish {
+            state_pending_insert(&mut state, release);
+        } else {
+            state_insert(&mut state, release, &generator_hash);
         }
-        write_state(&state_file, &state)?;
+    }
+    write_state(&state_file, &state)?;
+
+    if pending.is_empty() {
         println!("up to date: no new provider releases");
         return Ok(());
     }
 
     terraform::check_version(&manifest.terraform_cli_version)?;
-    let generator_hash = generator_fingerprint(root)?;
     let pending_count = pending.len();
     let mut generated_count = 0;
     let mut failures = Vec::new();
     for release in pending {
         match generate_release(&manifest, &release, &output, &snapshots, &generator_hash) {
             Ok(()) => {
-                state_insert(&mut state, &release);
+                if defer_publish {
+                    state_pending_insert(&mut state, &release);
+                } else {
+                    state_insert(&mut state, &release, &generator_hash);
+                }
                 generated_count += 1;
             }
             Err(error) => {
@@ -228,7 +224,11 @@ pub fn update(
     }
 
     for release in already_complete {
-        state_insert(&mut state, &release);
+        if defer_publish {
+            state_pending_insert(&mut state, &release);
+        } else {
+            state_insert(&mut state, &release, &generator_hash);
+        }
     }
     write_state(&state_file, &state)?;
     println!("generated {generated_count} of {pending_count} new provider release(s)");
@@ -242,39 +242,131 @@ pub fn update(
     Ok(())
 }
 
-fn unpublished_releases(
-    client: &Client,
-    candidates: &[ProviderRelease],
-    token: &str,
-) -> Result<Vec<ProviderRelease>> {
-    let mut repositories = BTreeMap::new();
-    for release in candidates {
-        let repository = cue_registry::repository_name(&release.module_path)?.to_owned();
-        repositories
-            .entry(repository)
-            .or_insert_with(|| release.module_path.clone());
+pub fn publish_generated(
+    root: &Path,
+    output: &Path,
+    snapshots: &Path,
+    state_file: &Path,
+) -> Result<()> {
+    require_serialized_publisher()?;
+    let manifest = manifest::load(root)?;
+    let output = rooted_path(root, output);
+    let snapshots = rooted_path(root, snapshots);
+    let state_file = rooted_path(root, state_file);
+    let mut state = load_state(&state_file)?;
+    let pending = pending_releases(&manifest, &state, None)?;
+    if pending.is_empty() {
+        println!("up to date: no generated provider releases are pending publication");
+        return Ok(());
     }
 
-    let mut published = BTreeMap::<String, HashSet<String>>::new();
-    for (repository, module_path) in repositories {
-        let tags = cue_registry::published_tags(client, &module_path, token)?;
-        published.insert(repository, tags);
-    }
-
-    let mut pending = Vec::new();
-    for release in candidates {
-        let repository = cue_registry::repository_name(&release.module_path)?;
-        let tag = cue_registry::release_tag(&release.provider_version);
-        if published
-            .get(repository)
-            .is_some_and(|tags| tags.contains(&tag))
-        {
-            println!("already published {}@{tag}", release.module_path);
-        } else {
-            pending.push(release.clone());
+    let generator_hash = generator_fingerprint(root)?;
+    let mut candidates = Vec::new();
+    let mut failures = Vec::new();
+    for release in pending {
+        match release_is_complete(&manifest, &release, &output, &snapshots, &generator_hash) {
+            Ok(true) => candidates.push(release),
+            Ok(false) => println!(
+                "{}@{} has no valid generated artifact; leaving it pending",
+                release.provider_path, release.provider_version
+            ),
+            Err(error) => {
+                let message = format!(
+                    "{}@{}: {error:#}",
+                    release.provider_path, release.provider_version
+                );
+                eprintln!("failed to validate generated {message}");
+                failures.push(message);
+            }
         }
     }
-    Ok(pending)
+    if candidates.is_empty() {
+        if failures.is_empty() {
+            println!("no valid generated provider releases are ready to publish");
+            return Ok(());
+        }
+        bail!(
+            "failed to validate {} generated provider release(s): {}",
+            failures.len(),
+            failures.join("; ")
+        );
+    }
+
+    let username =
+        std::env::var("GHCR_USERNAME").context("GHCR_USERNAME is required to publish")?;
+    let password = std::env::var("GHCR_TOKEN").context("GHCR_TOKEN is required to publish")?;
+    let client = http::client()?;
+    let ghcr_registry = cue_registry::GhcrRegistry::connect(
+        &client,
+        &candidates[0].module_path,
+        &username,
+        &password,
+    )?;
+    let published_tags = ghcr_registry.tags()?;
+
+    let registry_config = root.join("cue-registry.cue");
+    let mut published_count = 0;
+    let mut reconciled_count = 0;
+    for release in candidates {
+        let tag = cue_registry::registry_tag(&release.module_path, &release.module_version)?;
+        if published_tags.contains(&tag) {
+            println!("already published {tag} for {}", release.module_path);
+            state_insert(&mut state, &release, &generator_hash);
+            state_mark_published(&mut state, &release);
+            write_state(&state_file, &state)?;
+            reconciled_count += 1;
+            continue;
+        }
+
+        let result = verify_registry_target(&release, &registry_config).and_then(|()| {
+            if ghcr_registry.tag_exists(&tag)? {
+                return Ok(false);
+            }
+            publish_module(&module_root(&output, &release), &release, &registry_config)?;
+            Ok(true)
+        });
+        match result {
+            Ok(published) => {
+                state_insert(&mut state, &release, &generator_hash);
+                state_mark_published(&mut state, &release);
+                write_state(&state_file, &state)?;
+                if published {
+                    published_count += 1;
+                } else {
+                    reconciled_count += 1;
+                }
+            }
+            Err(error) => {
+                let message = format!(
+                    "{}@{}: {error:#}",
+                    release.provider_path, release.provider_version
+                );
+                eprintln!("failed to publish {message}");
+                failures.push(message);
+            }
+        }
+    }
+
+    println!(
+        "published {published_count} and reconciled {reconciled_count} provider release(s) in GHCR"
+    );
+    if !failures.is_empty() {
+        bail!(
+            "failed to publish {} provider release(s): {}",
+            failures.len(),
+            failures.join("; ")
+        );
+    }
+    Ok(())
+}
+
+fn require_serialized_publisher() -> Result<()> {
+    let actions = std::env::var("GITHUB_ACTIONS").is_ok_and(|value| value == "true");
+    let main_branch = std::env::var("GITHUB_REF").is_ok_and(|value| value == "refs/heads/main");
+    if !actions || !main_branch {
+        bail!("GHCR publication is restricted to the serialized GitHub Actions workflow on main");
+    }
+    Ok(())
 }
 
 fn pending_releases(
@@ -296,23 +388,31 @@ fn pending_releases(
     Ok(releases)
 }
 
-fn remember_pending(
-    state: &mut ReleaseState,
-    releases: &[ProviderRelease],
+fn published_releases(
+    manifest: &manifest::Manifest,
+    state: &ReleaseState,
     provider_filter: Option<&str>,
-) {
-    if let Some(provider) = provider_filter {
-        state.pending.remove(provider);
-    } else {
-        state.pending.clear();
+) -> Result<Vec<ProviderRelease>> {
+    let mut releases = Vec::new();
+    for (provider_path, versions) in &state.published {
+        if provider_filter.is_some_and(|filter| filter != provider_path)
+            || !manifest.providers.contains_key(provider_path)
+        {
+            continue;
+        }
+        for version in versions.keys() {
+            releases.push(manifest::release(manifest, provider_path, version)?);
+        }
     }
-    for release in releases {
-        state
-            .pending
-            .entry(release.provider_path.clone())
-            .or_default()
-            .insert(release.provider_version.clone());
-    }
+    Ok(releases)
+}
+
+fn state_pending_insert(state: &mut ReleaseState, release: &ProviderRelease) {
+    state
+        .pending
+        .entry(release.provider_path.clone())
+        .or_default()
+        .insert(release.provider_version.clone());
 }
 
 fn forget_pending(state: &mut ReleaseState, release: &ProviderRelease) {
@@ -324,12 +424,61 @@ fn forget_pending(state: &mut ReleaseState, release: &ProviderRelease) {
     }
 }
 
-fn publish_module(module_root: &Path, release: &ProviderRelease) -> Result<()> {
-    let tag = cue_registry::release_tag(&release.provider_version);
+fn verify_registry_target(release: &ProviderRelease, registry_config: &Path) -> Result<()> {
+    let module_path = release
+        .module_path
+        .rsplit_once("@v")
+        .map(|(path, _)| path)
+        .context("CUE module path is missing its major version")?;
+    let module_reference = format!("{module_path}@{}", release.module_version);
+    let output = Command::new("cue")
+        .args(["mod", "resolve", module_reference.as_str()])
+        .env(
+            "CUE_REGISTRY",
+            format!("file:{}", registry_config.display()),
+        )
+        .output()
+        .with_context(|| format!("resolve CUE registry destination for {module_reference}"))?;
+    if !output.status.success() {
+        bail!(
+            "`cue mod resolve {module_reference}` failed: {}{}{}",
+            String::from_utf8_lossy(&output.stdout).trim(),
+            if output.stdout.is_empty() || output.stderr.is_empty() {
+                ""
+            } else {
+                "\n"
+            },
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let expected = format!(
+        "ghcr.io/cuenv/terraform-cue:{}",
+        cue_registry::registry_tag(&release.module_path, &release.module_version)?
+    );
+    let actual = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if actual != expected {
+        bail!(
+            "CUE resolves {module_reference} to {actual:?}, expected GHCR destination {expected:?}"
+        );
+    }
+    Ok(())
+}
+
+fn publish_module(
+    module_root: &Path,
+    release: &ProviderRelease,
+    registry_config: &Path,
+) -> Result<()> {
+    let tag = &release.module_version;
     println!("publishing {}@{tag}", release.module_path);
     let output = Command::new("cue")
-        .args(["mod", "publish", &tag])
+        .args(["mod", "publish", tag.as_str()])
         .current_dir(module_root)
+        .env(
+            "CUE_REGISTRY",
+            format!("file:{}", registry_config.display()),
+        )
         .output()
         .with_context(|| format!("start `cue mod publish {tag}` for {}", release.module_path))?;
     if !output.status.success() {
@@ -417,6 +566,7 @@ fn generate_release(
         },
         "cue_module": {
             "path": release.module_path,
+            "version": release.module_version,
             "language_version": manifest.cue_language_version,
         },
         "generation": {
@@ -457,6 +607,7 @@ fn release_is_complete(
     release: &ProviderRelease,
     output: &Path,
     snapshots: &Path,
+    generator_hash: &str,
 ) -> Result<bool> {
     let module_root = module_root(output, release);
     let snapshot_root = snapshot_root(snapshots, release);
@@ -483,6 +634,18 @@ fn release_is_complete(
         &fs::read(&metadata_path).context("read provider generation metadata")?,
     )
     .with_context(|| format!("parse provider metadata at {}", metadata_path.display()))?;
+    let actual_module =
+        fs::read_to_string(&module_file).context("read generated CUE module identity")?;
+    let expected_module = module_cue(release, &manifest.cue_language_version)?;
+    if actual_module != expected_module {
+        bail!(
+            "{} has a cue.mod/module.cue identity that does not match its expected module path and language version",
+            release.module_path
+        );
+    }
+    if metadata_value(&metadata, "generation.generator_sha256") != Some(generator_hash) {
+        return Ok(false);
+    }
     for (path, expected) in [
         ("terraform_provider.source", release.source.as_str()),
         (
@@ -490,6 +653,7 @@ fn release_is_complete(
             release.provider_version.as_str(),
         ),
         ("cue_module.path", release.module_path.as_str()),
+        ("cue_module.version", release.module_version.as_str()),
         (
             "cue_module.language_version",
             manifest.cue_language_version.as_str(),
@@ -548,6 +712,14 @@ fn load_state(path: &Path) -> Result<ReleaseState> {
         .with_context(|| format!("parse provider release state at {}", path.display()))
 }
 
+fn read_published_tags(path: &Path) -> Result<HashSet<String>> {
+    let tags: Vec<String> = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("read GHCR tags from {}", path.display()))?,
+    )
+    .with_context(|| format!("parse GHCR tags from {}", path.display()))?;
+    Ok(tags.into_iter().collect())
+}
+
 fn write_state(path: &Path, state: &ReleaseState) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -566,19 +738,67 @@ fn write_state(path: &Path, state: &ReleaseState) -> Result<()> {
     Ok(())
 }
 
-fn state_contains(state: &ReleaseState, release: &ProviderRelease) -> bool {
+fn state_contains(state: &ReleaseState, release: &ProviderRelease, generator_hash: &str) -> bool {
+    let identity = release_identity(release, generator_hash);
     state
         .completed
         .get(&release.provider_path)
-        .is_some_and(|versions| versions.get(&release.provider_version) == Some(&release.source))
+        .is_some_and(|versions| versions.get(&release.provider_version) == Some(&identity))
 }
 
-fn state_insert(state: &mut ReleaseState, release: &ProviderRelease) {
+fn state_insert(state: &mut ReleaseState, release: &ProviderRelease, generator_hash: &str) {
+    forget_pending(state, release);
     state
         .completed
         .entry(release.provider_path.clone())
         .or_default()
-        .insert(release.provider_version.clone(), release.source.clone());
+        .insert(
+            release.provider_version.clone(),
+            release_identity(release, generator_hash),
+        );
+}
+
+fn state_is_published(state: &ReleaseState, release: &ProviderRelease) -> bool {
+    let identity = published_identity(release);
+    state
+        .published
+        .get(&release.provider_path)
+        .is_some_and(|versions| versions.get(&release.provider_version) == Some(&identity))
+}
+
+fn state_mark_published(state: &mut ReleaseState, release: &ProviderRelease) {
+    forget_pending(state, release);
+    state
+        .published
+        .entry(release.provider_path.clone())
+        .or_default()
+        .insert(
+            release.provider_version.clone(),
+            published_identity(release),
+        );
+}
+
+fn state_forget_published(state: &mut ReleaseState, release: &ProviderRelease) {
+    if let Some(versions) = state.published.get_mut(&release.provider_path) {
+        versions.remove(&release.provider_version);
+        if versions.is_empty() {
+            state.published.remove(&release.provider_path);
+        }
+    }
+}
+
+fn published_identity(release: &ProviderRelease) -> String {
+    format!(
+        "{}|{}|{}",
+        release.source, release.module_path, release.module_version
+    )
+}
+
+fn release_identity(release: &ProviderRelease, generator_hash: &str) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        release.source, release.module_path, release.module_version, generator_hash
+    )
 }
 
 #[cfg(test)]
@@ -592,7 +812,7 @@ mod tests {
     fn restores_pending_versions_outside_the_discovery_window() {
         let provider_path = "terraform/cloudflare/cloudflare";
         let manifest = Manifest {
-            module_prefix: "github.com/cuenv/terraform".to_owned(),
+            module_prefix: "ghcr.io/cuenv".to_owned(),
             cue_language_version: "v0.16.0".to_owned(),
             terraform_cli_version: "1.16.4".to_owned(),
             providers: BTreeMap::from([(
@@ -609,6 +829,7 @@ mod tests {
                 provider_path.to_owned(),
                 BTreeSet::from(["5.25.0".to_owned()]),
             )]),
+            published: BTreeMap::new(),
         };
 
         let releases =
@@ -656,13 +877,20 @@ fn collect_rust_sources(directory: &Path, sources: &mut Vec<PathBuf>) -> Result<
 fn module_root(output: &Path, release: &ProviderRelease) -> PathBuf {
     output
         .join(&release.provider_path)
-        .join(&release.provider_version)
+        .join(local_version(release))
 }
 
 fn snapshot_root(snapshots: &Path, release: &ProviderRelease) -> PathBuf {
     snapshots
         .join(&release.provider_path)
-        .join(&release.provider_version)
+        .join(local_version(release))
+}
+
+fn local_version(release: &ProviderRelease) -> &str {
+    release
+        .module_version
+        .strip_prefix('v')
+        .unwrap_or(&release.module_version)
 }
 
 fn rooted_path(root: &Path, path: &Path) -> PathBuf {

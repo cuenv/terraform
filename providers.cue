@@ -3,7 +3,7 @@
 // Baselines are stable linux_amd64 releases available on 2026-09-27.
 package providers
 
-module_prefix:         "github.com/cuenv/terraform"
+module_prefix:         "ghcr.io/cuenv"
 cue_language_version:  "v0.16.0"
 terraform_cli_version: "1.16.4"
 

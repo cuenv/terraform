@@ -9,7 +9,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: generate-terraform-provider-cue
@@ -17,11 +16,16 @@ concurrency:
 
 jobs:
   generate:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    environment: production
     timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: read
     outputs:
       has_updates: ${{ steps.plan.outputs.has_updates }}
+      has_generated: ${{ steps.generate.outputs.has_generated }}
+      generation_failed: ${{ steps.generate.outputs.generation_failed }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -48,13 +52,13 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .provider-release-state.json
-          key: terraform-cue-pending-v1-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: terraform-cue-pending-v1-
+          key: terraform-cue-state-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: terraform-cue-state-v2-
 
       - name: Initialize pending release state
         run: |
           if [ ! -f .provider-release-state.json ]; then
-            printf '{"completed": {}, "pending": {}}\n' > .provider-release-state.json
+            printf '{"completed": {}, "pending": {}, "published": {}}\n' > .provider-release-state.json
           fi
 
       - name: Build generator
@@ -64,21 +68,25 @@ jobs:
         id: terraform-version
         run: echo "version=$(target/release/terraform-cue terraform-version)" >> "$GITHUB_OUTPUT"
 
-      - name: Authenticate to the CUE Registry
-        id: cue-registry-login
-        uses: cue-labs/registry-login-action@v1
+      - name: Check published GHCR tags
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/provider-cue"
+          target/release/terraform-cue registry-tags > "$RUNNER_TEMP/provider-cue/ghcr-tags.json"
 
       - name: Check for new provider releases
         id: plan
-        env:
-          CUE_REGISTRY_TOKEN: ${{ steps.cue-registry-login.outputs.access_token }}
         shell: bash
         run: |
           set -o pipefail
           target/release/terraform-cue update \
-            --publish \
-            --dry-run | tee "$RUNNER_TEMP/provider-update-plan.txt"
-          if grep -Eq '^would publish [1-9][0-9]* provider release' "$RUNNER_TEMP/provider-update-plan.txt"; then
+            --defer-publish \
+            --dry-run \
+            --state-file .provider-release-state.json \
+            --published-tags "$RUNNER_TEMP/provider-cue/ghcr-tags.json" | tee "$RUNNER_TEMP/provider-update-plan.txt"
+          if grep -Eq '^would (generate|publish) [1-9][0-9]* (previously generated )?provider release' "$RUNNER_TEMP/provider-update-plan.txt"; then
             echo "has_updates=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_updates=false" >> "$GITHUB_OUTPUT"
@@ -90,30 +98,115 @@ jobs:
           terraform_version: ${{ steps.terraform-version.outputs.version }}
           terraform_wrapper: false
 
-      - name: Install CUE publisher
+      - name: Generate new provider definitions
+        id: generate
         if: steps.plan.outputs.has_updates == 'true'
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/provider-cue/bundle"
+          set +e
+          target/release/terraform-cue update --defer-publish \
+            --output "$RUNNER_TEMP/provider-cue/bundle/generated" \
+            --snapshots "$RUNNER_TEMP/provider-cue/bundle/snapshots" \
+            --state-file .provider-release-state.json \
+            --published-tags "$RUNNER_TEMP/provider-cue/ghcr-tags.json" \
+            2>&1 | tee "$RUNNER_TEMP/provider-generation.log"
+          generation_status=${PIPESTATUS[0]}
+          set -e
+          cp .provider-release-state.json "$RUNNER_TEMP/provider-cue/bundle/provider-release-state.json"
+          if find "$RUNNER_TEMP/provider-cue/bundle/snapshots" -type f -name metadata.json -print -quit | grep -q .; then
+            echo "has_generated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_generated=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$generation_status" -ne 0 ]; then
+            echo "generation_failed=true" >> "$GITHUB_OUTPUT"
+            echo "Provider generation failed with status $generation_status; retaining successful outputs for publication."
+          else
+            echo "generation_failed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Cache pending provider releases
+        if: always() && steps.plan.outcome == 'success' && steps.plan.outputs.has_updates == 'true' && steps.generate.outcome != 'skipped'
+        uses: actions/cache/save@v4
+        with:
+          path: .provider-release-state.json
+          key: terraform-cue-state-v2-generation-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload generated provider modules
+        if: always() && steps.plan.outputs.has_updates == 'true' && steps.generate.outputs.has_generated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: provider-cue-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/provider-cue/bundle
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Report provider generation failures
+        if: steps.generate.outputs.generation_failed == 'true'
+        run: exit 1
+
+  publish:
+    needs: generate
+    if: always() && !cancelled() && github.ref == 'refs/heads/main' && needs.generate.outputs.has_updates == 'true' && needs.generate.outputs.has_generated == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache: false
+
+      - name: Build publisher
+        run: cargo build --locked --release
+
+      - name: Download generated provider modules
+        id: download
+        uses: actions/download-artifact@v4
+        with:
+          name: provider-cue-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/provider-cue/bundle
+
+      - name: Install CUE publisher
         run: |
           mkdir -p "$RUNNER_TEMP/cue-bin"
           GOBIN="$RUNNER_TEMP/cue-bin" go install cuelang.org/go/cmd/cue@v0.16.0
           echo "$RUNNER_TEMP/cue-bin" >> "$GITHUB_PATH"
 
-      - name: Generate and publish new provider definitions
-        id: generate
-        if: steps.plan.outputs.has_updates == 'true'
-        env:
-          CUE_REGISTRY_TOKEN: ${{ steps.cue-registry-login.outputs.access_token }}
-        shell: bash
-        run: |
-          set -o pipefail
-          target/release/terraform-cue update \
-            --publish \
-            --output "$RUNNER_TEMP/provider-cue/generated" \
-            --snapshots "$RUNNER_TEMP/provider-cue/snapshots" \
-            2>&1 | tee "$RUNNER_TEMP/provider-generation.log"
+      - name: Authenticate to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Save pending provider releases
-        if: always() && steps.plan.outcome == 'success'
+      - name: Publish generated modules
+        id: publish
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          target/release/terraform-cue publish-generated \
+            --output "$RUNNER_TEMP/provider-cue/bundle/generated" \
+            --snapshots "$RUNNER_TEMP/provider-cue/bundle/snapshots" \
+            --state-file "$RUNNER_TEMP/provider-cue/bundle/provider-release-state.json"
+
+      - name: Restore updated provider release state
+        if: always() && steps.download.outcome == 'success'
+        run: cp "$RUNNER_TEMP/provider-cue/bundle/provider-release-state.json" .provider-release-state.json
+
+      - name: Cache published provider releases
+        if: always() && steps.download.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: .provider-release-state.json
-          key: terraform-cue-pending-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          key: terraform-cue-state-v2-published-${{ github.run_id }}-${{ github.run_attempt }}

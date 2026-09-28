@@ -34,7 +34,7 @@ enum Command {
         #[arg(long, default_value = "schema-snapshots")]
         snapshots: PathBuf,
     },
-    /// Generate newly released definitions and optionally publish missing CUE Registry tags.
+    /// Generate newly released definitions and optionally defer registry publication.
     Update {
         #[arg(long)]
         provider: Option<String>,
@@ -47,9 +47,23 @@ enum Command {
         /// List missing releases without generating CUE files; update pending release IDs.
         #[arg(long)]
         dry_run: bool,
-        /// Publish generated provider modules to the CUE Registry after validation.
+        /// Leave generated releases pending for a separate publisher job.
         #[arg(long)]
-        publish: bool,
+        defer_publish: bool,
+        /// Skip exact module versions whose GHCR tags are listed in this JSON file.
+        #[arg(long)]
+        published_tags: Option<PathBuf>,
+    },
+    /// Read the published CUE module tags from GHCR.
+    RegistryTags,
+    /// Publish generated CUE modules to GHCR from a deferred generation run.
+    PublishGenerated {
+        #[arg(long, default_value = "generated")]
+        output: PathBuf,
+        #[arg(long, default_value = "schema-snapshots")]
+        snapshots: PathBuf,
+        #[arg(long, default_value = ".provider-release-state.json")]
+        state_file: PathBuf,
     },
     /// Print the Terraform CLI version pinned in providers.cue.
     TerraformVersion,
@@ -78,16 +92,24 @@ fn main() -> Result<()> {
             snapshots,
             state_file,
             dry_run,
-            publish,
+            defer_publish,
+            published_tags,
         } => generate::update(
             &root,
             provider.as_deref(),
             &output,
             &snapshots,
             &state_file,
+            published_tags.as_deref(),
             dry_run,
-            publish,
+            defer_publish,
         ),
+        Command::RegistryTags => generate::registry_tags(&root),
+        Command::PublishGenerated {
+            output,
+            snapshots,
+            state_file,
+        } => generate::publish_generated(&root, &output, &snapshots, &state_file),
         Command::TerraformVersion => {
             let manifest = manifest::load(&root)?;
             println!("{}", manifest.terraform_cli_version);
